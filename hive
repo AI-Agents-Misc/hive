@@ -1,0 +1,318 @@
+#!/usr/bin/env bash
+# hive — LLM Hive Mind CLI
+# Uses GitHub Issues + Projects v2 as a shared memory bus across LLM CLI tools.
+set -euo pipefail
+
+HIVE_DIR=".hive"
+CONFIG_FILE="$HIVE_DIR/config.json"
+
+# ─── Colors ───────────────────────────────────────────────────────────────────
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+RESET='\033[0m'
+
+# ─── JSON Helpers ─────────────────────────────────────────────────────────────
+# Uses jq if available, falls back to python3.
+
+json_read() {
+  local file="$1" query="$2"
+  if command -v jq &>/dev/null; then
+    jq -r "$query" "$file"
+  else
+    python3 -c "
+import json, sys
+with open('$file') as f:
+    data = json.load(f)
+parts = '''$query'''.strip('.').split('.')
+val = data
+for p in parts:
+    if p == '':
+        continue
+    val = val[p]
+print(val if val is not None else 'null')
+"
+  fi
+}
+
+json_set_topic() {
+  local file="$1" name="$2" project_number="$3" created="$4"
+  if command -v jq &>/dev/null; then
+    local tmp
+    tmp=$(mktemp)
+    jq --arg name "$name" \
+       --argjson num "$project_number" \
+       --arg ts "$created" \
+       '.topics[$name] = {"project_number": $num, "created": $ts} | .active_topic = $name' \
+       "$file" > "$tmp" && mv "$tmp" "$file"
+  else
+    HIVE_FILE="$file" HIVE_NAME="$name" HIVE_NUM="$project_number" HIVE_TS="$created" \
+    python3 -c "
+import json, os
+f_path, name = os.environ['HIVE_FILE'], os.environ['HIVE_NAME']
+num, ts = int(os.environ['HIVE_NUM']), os.environ['HIVE_TS']
+with open(f_path) as f:
+    data = json.load(f)
+data['topics'][name] = {'project_number': num, 'created': ts}
+data['active_topic'] = name
+with open(f_path, 'w') as f:
+    json.dump(data, f, indent=2)
+    f.write('\n')
+"
+  fi
+}
+
+# ─── Config ───────────────────────────────────────────────────────────────────
+
+init_config() {
+  if [[ ! -d "$HIVE_DIR" ]]; then
+    mkdir -p "$HIVE_DIR"
+  fi
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    cat > "$CONFIG_FILE" <<'EOF'
+{
+  "active_topic": null,
+  "topics": {}
+}
+EOF
+    echo -e "${DIM}Initialized $CONFIG_FILE${RESET}"
+  fi
+}
+
+load_config() {
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    init_config
+  fi
+}
+
+# ─── gh CLI Validation ────────────────────────────────────────────────────────
+
+check_gh() {
+  # 1. Check gh is installed
+  if ! command -v gh &>/dev/null; then
+    echo -e "${RED}Error:${RESET} gh CLI is not installed."
+    echo "  Install: https://cli.github.com/"
+    exit 1
+  fi
+
+  # 2. Check gh is authenticated
+  if ! gh auth status &>/dev/null 2>&1; then
+    echo -e "${RED}Error:${RESET} gh CLI is not authenticated."
+    echo "  Run: gh auth login"
+    exit 1
+  fi
+
+  # 3. Check project scope
+  local scopes
+  scopes=$(gh auth status 2>&1 || true)
+  if ! echo "$scopes" | grep -q "project"; then
+    echo -e "${YELLOW}Warning:${RESET} gh CLI is missing the 'project' scope."
+    echo "  Run: gh auth refresh -s project"
+    exit 1
+  fi
+}
+
+# ─── Topic Commands ───────────────────────────────────────────────────────────
+
+cmd_topic_create() {
+  local name="${1:-}"
+
+  if [[ -z "$name" ]]; then
+    echo -e "${RED}Error:${RESET} Topic name required."
+    echo "  Usage: hive topic create <name>"
+    exit 1
+  fi
+
+  # Validate kebab-case
+  if [[ ! "$name" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+    echo -e "${RED}Error:${RESET} Invalid topic name '${name}'."
+    echo "  Must be kebab-case: lowercase letters, numbers, and hyphens."
+    echo "  Example: hive topic create auth-refactor"
+    exit 1
+  fi
+
+  check_gh
+  load_config
+
+  # Check for duplicate
+  local existing
+  existing=$(json_read "$CONFIG_FILE" ".topics.\"$name\"" 2>/dev/null || echo "null")
+  if [[ "$existing" != "null" ]]; then
+    echo -e "${RED}Error:${RESET} Topic '${name}' already exists."
+    exit 1
+  fi
+
+  # Create GitHub Project v2 via GraphQL (gh project create is broken in v2.87+)
+  echo -e "${DIM}Creating GitHub Project...${RESET}"
+  local owner_id project_result project_number
+  owner_id=$(gh api graphql -f query='{ viewer { id } }' -q '.data.viewer.id' 2>/dev/null) || {
+    echo -e "${RED}Error:${RESET} Failed to resolve GitHub user ID."
+    exit 1
+  }
+  project_result=$(gh api graphql \
+    -F ownerId="$owner_id" \
+    -F title="hive: $name" \
+    -f query='
+      mutation($ownerId: ID!, $title: String!) {
+        createProjectV2(input: {ownerId: $ownerId, title: $title}) {
+          projectV2 { number }
+        }
+      }
+    ' 2>/dev/null) || {
+    echo -e "${RED}Error:${RESET} Failed to create GitHub Project."
+    exit 1
+  }
+  if command -v jq &>/dev/null; then
+    project_number=$(echo "$project_result" | jq -r '.data.createProjectV2.projectV2.number')
+  else
+    project_number=$(python3 -c "import json,sys; print(json.loads(sys.stdin.read())['data']['createProjectV2']['projectV2']['number'])" <<< "$project_result")
+  fi
+
+  if [[ -z "$project_number" || "$project_number" == "null" ]]; then
+    echo -e "${RED}Error:${RESET} Failed to parse project number from response."
+    exit 1
+  fi
+
+  # Store in config
+  local created
+  created=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  json_set_topic "$CONFIG_FILE" "$name" "$project_number" "$created"
+
+  echo -e "${GREEN}✓${RESET} Topic ${BOLD}${name}${RESET} created ${DIM}(project #${project_number})${RESET}"
+  echo -e "  Active topic set to ${CYAN}${name}${RESET}"
+}
+
+cmd_topic_list() {
+  load_config
+
+  # Read topics from config
+  local topics_json
+  topics_json=$(json_read "$CONFIG_FILE" ".topics" 2>/dev/null || echo "{}")
+
+  if [[ "$topics_json" == "{}" || "$topics_json" == "null" ]]; then
+    echo -e "${DIM}No topics yet — run: hive topic create <name>${RESET}"
+    return
+  fi
+
+  local active
+  active=$(json_read "$CONFIG_FILE" ".active_topic" 2>/dev/null || echo "null")
+
+  echo -e "${BOLD}Topics${RESET}"
+  echo ""
+
+  if command -v jq &>/dev/null; then
+    jq -r --arg active "$active" '
+      .topics | to_entries[] |
+      (if .key == $active then "  * " else "    " end) +
+      .key + "  #" + (.value.project_number | tostring) + "  " + .value.created
+    ' "$CONFIG_FILE"
+  else
+    python3 -c "
+import json
+with open('$CONFIG_FILE') as f:
+    data = json.load(f)
+active = data.get('active_topic')
+for name, info in sorted(data.get('topics', {}).items()):
+    marker = '  * ' if name == active else '    '
+    print(f\"{marker}{name}  #{info['project_number']}  {info['created']}\")
+"
+  fi
+
+  echo ""
+  echo -e "${DIM}* = active topic${RESET}"
+}
+
+cmd_topic() {
+  local subcmd="${1:-}"
+  shift || true
+
+  case "$subcmd" in
+    create)
+      cmd_topic_create "$@"
+      ;;
+    list|ls)
+      cmd_topic_list
+      ;;
+    "")
+      echo -e "${RED}Error:${RESET} Missing subcommand."
+      echo "  Usage: hive topic <create|list> [args]"
+      exit 1
+      ;;
+    *)
+      echo -e "${RED}Error:${RESET} Unknown topic subcommand '${subcmd}'."
+      echo "  Available: create, list"
+      exit 1
+      ;;
+  esac
+}
+
+# ─── Help ─────────────────────────────────────────────────────────────────────
+
+cmd_help() {
+  cat <<EOF
+
+${BOLD}hive${RESET} — LLM Hive Mind CLI
+  Shared memory bus for LLM CLI tools via GitHub Issues + Projects v2.
+
+${BOLD}Usage:${RESET}
+  hive <command> [subcommand] [args]
+
+${BOLD}Commands:${RESET}
+  topic create <name>    Create a new topic (GitHub Project)
+  topic list             List all topics
+  log <message>          Log a thought to the active topic (coming soon)
+  read                   Read the conversation log (coming soon)
+  status                 Show current hive status (coming soon)
+
+${BOLD}Options:${RESET}
+  --help, -h             Show this help message
+
+${BOLD}Examples:${RESET}
+  hive topic create auth-refactor
+  hive topic list
+
+EOF
+}
+
+# ─── Main Router ──────────────────────────────────────────────────────────────
+
+main() {
+  local cmd="${1:-}"
+  shift || true
+
+  case "$cmd" in
+    topic)
+      cmd_topic "$@"
+      ;;
+    log)
+      echo -e "${YELLOW}Coming soon:${RESET} hive log"
+      exit 0
+      ;;
+    read)
+      echo -e "${YELLOW}Coming soon:${RESET} hive read"
+      exit 0
+      ;;
+    status)
+      echo -e "${YELLOW}Coming soon:${RESET} hive status"
+      exit 0
+      ;;
+    --help|-h|help)
+      cmd_help
+      ;;
+    "")
+      cmd_help
+      exit 1
+      ;;
+    *)
+      echo -e "${RED}Error:${RESET} Unknown command '${cmd}'."
+      echo "  Run 'hive --help' for usage."
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
