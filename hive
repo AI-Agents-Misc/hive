@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # hive — LLM Hive Mind CLI
-# Uses GitHub Issues + Projects v2 as a shared memory bus across LLM CLI tools.
+# Shared memory bus for LLM CLI tools via GitHub Issues + Projects v2.
+# Hub repo holds Issues (log entries) and Labels (topics).
+# Org-level Project provides the visual dashboard.
 set -euo pipefail
 
-HIVE_DIR=".hive"
-CONFIG_FILE="$HIVE_DIR/config.json"
+CONFIG_DIR="${HOME}/.config/hive"
+CONFIG_FILE="${CONFIG_DIR}/config.json"
 
 # ─── Colors ───────────────────────────────────────────────────────────────────
 
@@ -17,49 +19,55 @@ DIM='\033[2m'
 RESET='\033[0m'
 
 # ─── JSON Helpers ─────────────────────────────────────────────────────────────
-# Uses jq if available, falls back to python3.
 
-json_read() {
-  local file="$1" query="$2"
+config_get() {
+  local key="$1"
   if command -v jq &>/dev/null; then
-    jq -r "$query" "$file"
+    jq -r ".$key // empty" "$CONFIG_FILE"
   else
     python3 -c "
-import json, sys
-with open('$file') as f:
-    data = json.load(f)
-parts = '''$query'''.strip('.').split('.')
-val = data
-for p in parts:
-    if p == '':
-        continue
-    val = val[p]
-print(val if val is not None else 'null')
+import json
+with open('$CONFIG_FILE') as f:
+    v = json.load(f).get('$key')
+print(v if v is not None else '')
 "
   fi
 }
 
-json_set_topic() {
-  local file="$1" name="$2" project_number="$3" created="$4"
+config_set() {
+  local key="$1" value="$2"
   if command -v jq &>/dev/null; then
     local tmp
     tmp=$(mktemp)
-    jq --arg name "$name" \
-       --argjson num "$project_number" \
-       --arg ts "$created" \
-       '.topics[$name] = {"project_number": $num, "created": $ts} | .active_topic = $name' \
-       "$file" > "$tmp" && mv "$tmp" "$file"
+    jq --arg v "$value" ".$key = \$v" "$CONFIG_FILE" > "$tmp" && mv "$tmp" "$CONFIG_FILE"
   else
-    HIVE_FILE="$file" HIVE_NAME="$name" HIVE_NUM="$project_number" HIVE_TS="$created" \
-    python3 -c "
+    HIVE_KEY="$key" HIVE_VAL="$value" python3 -c "
 import json, os
-f_path, name = os.environ['HIVE_FILE'], os.environ['HIVE_NAME']
-num, ts = int(os.environ['HIVE_NUM']), os.environ['HIVE_TS']
-with open(f_path) as f:
+k, v = os.environ['HIVE_KEY'], os.environ['HIVE_VAL']
+with open('$CONFIG_FILE') as f:
     data = json.load(f)
-data['topics'][name] = {'project_number': num, 'created': ts}
-data['active_topic'] = name
-with open(f_path, 'w') as f:
+data[k] = v
+with open('$CONFIG_FILE', 'w') as f:
+    json.dump(data, f, indent=2)
+    f.write('\n')
+"
+  fi
+}
+
+config_set_num() {
+  local key="$1" value="$2"
+  if command -v jq &>/dev/null; then
+    local tmp
+    tmp=$(mktemp)
+    jq --argjson v "$value" ".$key = \$v" "$CONFIG_FILE" > "$tmp" && mv "$tmp" "$CONFIG_FILE"
+  else
+    HIVE_KEY="$key" HIVE_VAL="$value" python3 -c "
+import json, os
+k, v = os.environ['HIVE_KEY'], int(os.environ['HIVE_VAL'])
+with open('$CONFIG_FILE') as f:
+    data = json.load(f)
+data[k] = v
+with open('$CONFIG_FILE', 'w') as f:
     json.dump(data, f, indent=2)
     f.write('\n')
 "
@@ -69,17 +77,15 @@ with open(f_path, 'w') as f:
 # ─── Config ───────────────────────────────────────────────────────────────────
 
 init_config() {
-  if [[ ! -d "$HIVE_DIR" ]]; then
-    mkdir -p "$HIVE_DIR"
-  fi
+  mkdir -p "$CONFIG_DIR"
   if [[ ! -f "$CONFIG_FILE" ]]; then
     cat > "$CONFIG_FILE" <<'EOF'
 {
+  "hub": null,
   "active_topic": null,
-  "topics": {}
+  "project_number": null
 }
 EOF
-    echo -e "${DIM}Initialized $CONFIG_FILE${RESET}"
   fi
 }
 
@@ -89,31 +95,120 @@ load_config() {
   fi
 }
 
+require_hub() {
+  load_config
+  local hub
+  hub=$(config_get "hub")
+  if [[ -z "$hub" ]]; then
+    echo -e "${RED}Error:${RESET} No hub repo configured." >&2
+    echo "  Run: hive init <owner/repo>" >&2
+    exit 1
+  fi
+  echo "$hub"
+}
+
+require_topic() {
+  local topic
+  topic=$(config_get "active_topic")
+  if [[ -z "$topic" ]]; then
+    echo -e "${RED}Error:${RESET} No active topic." >&2
+    echo "  Run: hive topic create <name>" >&2
+    exit 1
+  fi
+  echo "$topic"
+}
+
 # ─── gh CLI Validation ────────────────────────────────────────────────────────
 
 check_gh() {
-  # 1. Check gh is installed
   if ! command -v gh &>/dev/null; then
     echo -e "${RED}Error:${RESET} gh CLI is not installed."
     echo "  Install: https://cli.github.com/"
     exit 1
   fi
-
-  # 2. Check gh is authenticated
   if ! gh auth status &>/dev/null 2>&1; then
     echo -e "${RED}Error:${RESET} gh CLI is not authenticated."
     echo "  Run: gh auth login"
     exit 1
   fi
+}
 
-  # 3. Check project scope
-  local scopes
-  scopes=$(gh auth status 2>&1 || true)
-  if ! echo "$scopes" | grep -q "project"; then
-    echo -e "${YELLOW}Warning:${RESET} gh CLI is missing the 'project' scope."
-    echo "  Run: gh auth refresh -s project"
+# ─── Init Command ─────────────────────────────────────────────────────────────
+
+cmd_init() {
+  local hub="${1:-}"
+
+  if [[ -z "$hub" ]]; then
+    echo -e "${RED}Error:${RESET} Hub repo required."
+    echo "  Usage: hive init <owner/repo>"
+    echo "  Example: hive init AI-Agents-Misc/hive-hub"
     exit 1
   fi
+
+  check_gh
+  load_config
+
+  local org repo
+  org="${hub%%/*}"
+  repo="${hub##*/}"
+
+  # Check if repo exists
+  if ! gh repo view "$hub" --json name &>/dev/null 2>&1; then
+    echo -e "${DIM}Hub repo not found. Creating...${RESET}"
+    gh repo create "$hub" --public --description "Hive Mind — shared coordination hub for LLM CLI tools" 2>/dev/null || {
+      echo -e "${RED}Error:${RESET} Failed to create repo '$hub'."
+      exit 1
+    }
+    echo -e "${GREEN}✓${RESET} Created repo ${BOLD}${hub}${RESET}"
+  fi
+
+  # Store hub in config
+  config_set "hub" "$hub"
+
+  # Create org-level Project "Hive Mind" via GraphQL
+  echo -e "${DIM}Creating org-level Project...${RESET}"
+  local owner_id project_result project_number
+
+  # Determine if owner is an org or user
+  owner_id=$(gh api graphql -f query="{ organization(login: \"$org\") { id } }" -q '.data.organization.id' 2>/dev/null) || true
+
+  if [[ -z "$owner_id" ]]; then
+    # Fall back to user
+    owner_id=$(gh api graphql -f query='{ viewer { id } }' -q '.data.viewer.id' 2>/dev/null) || {
+      echo -e "${RED}Error:${RESET} Failed to resolve owner ID."
+      exit 1
+    }
+  fi
+
+  project_result=$(gh api graphql \
+    -F ownerId="$owner_id" \
+    -F title="Hive Mind" \
+    -f query='
+      mutation($ownerId: ID!, $title: String!) {
+        createProjectV2(input: {ownerId: $ownerId, title: $title}) {
+          projectV2 { number }
+        }
+      }
+    ' 2>/dev/null) || {
+    echo -e "${YELLOW}Warning:${RESET} Failed to create Project. Continuing without dashboard."
+    echo "  You may need: gh auth refresh -s project"
+    config_set_num "project_number" "0"
+    echo -e "${GREEN}✓${RESET} Hub set to ${BOLD}${hub}${RESET}"
+    return
+  }
+
+  if command -v jq &>/dev/null; then
+    project_number=$(echo "$project_result" | jq -r '.data.createProjectV2.projectV2.number')
+  else
+    project_number=$(python3 -c "import json,sys; print(json.loads(sys.stdin.read())['data']['createProjectV2']['projectV2']['number'])" <<< "$project_result")
+  fi
+
+  config_set_num "project_number" "$project_number"
+
+  echo -e "${GREEN}✓${RESET} Hub set to ${BOLD}${hub}${RESET}"
+  echo -e "${GREEN}✓${RESET} Project ${BOLD}Hive Mind${RESET} created ${DIM}(#${project_number})${RESET}"
+  echo ""
+  echo -e "  ${DIM}Next: hive topic create <name>${RESET}"
 }
 
 # ─── Topic Commands ───────────────────────────────────────────────────────────
@@ -136,94 +231,87 @@ cmd_topic_create() {
   fi
 
   check_gh
-  load_config
+  local hub
+  hub=$(require_hub)
 
-  # Check for duplicate
-  local existing
-  existing=$(json_read "$CONFIG_FILE" ".topics.\"$name\"" 2>/dev/null || echo "null")
-  if [[ "$existing" != "null" ]]; then
-    echo -e "${RED}Error:${RESET} Topic '${name}' already exists."
-    exit 1
-  fi
-
-  # Create GitHub Project v2 via GraphQL (gh project create is broken in v2.87+)
-  echo -e "${DIM}Creating GitHub Project...${RESET}"
-  local owner_id project_result project_number
-  owner_id=$(gh api graphql -f query='{ viewer { id } }' -q '.data.viewer.id' 2>/dev/null) || {
-    echo -e "${RED}Error:${RESET} Failed to resolve GitHub user ID."
+  # Create label on hub repo (idempotent with --force)
+  gh label create "topic:${name}" \
+    --description "Hive topic: ${name}" \
+    --color 0E8A16 \
+    -R "$hub" \
+    --force &>/dev/null || {
+    echo -e "${RED}Error:${RESET} Failed to create label on ${hub}."
     exit 1
   }
-  project_result=$(gh api graphql \
-    -F ownerId="$owner_id" \
-    -F title="hive: $name" \
-    -f query='
-      mutation($ownerId: ID!, $title: String!) {
-        createProjectV2(input: {ownerId: $ownerId, title: $title}) {
-          projectV2 { number }
-        }
-      }
-    ' 2>/dev/null) || {
-    echo -e "${RED}Error:${RESET} Failed to create GitHub Project."
-    exit 1
-  }
-  if command -v jq &>/dev/null; then
-    project_number=$(echo "$project_result" | jq -r '.data.createProjectV2.projectV2.number')
-  else
-    project_number=$(python3 -c "import json,sys; print(json.loads(sys.stdin.read())['data']['createProjectV2']['projectV2']['number'])" <<< "$project_result")
-  fi
 
-  if [[ -z "$project_number" || "$project_number" == "null" ]]; then
-    echo -e "${RED}Error:${RESET} Failed to parse project number from response."
-    exit 1
-  fi
+  # Set as active topic
+  config_set "active_topic" "$name"
 
-  # Store in config
-  local created
-  created=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-  json_set_topic "$CONFIG_FILE" "$name" "$project_number" "$created"
-
-  echo -e "${GREEN}✓${RESET} Topic ${BOLD}${name}${RESET} created ${DIM}(project #${project_number})${RESET}"
+  echo -e "${GREEN}✓${RESET} Topic ${BOLD}${name}${RESET} created"
   echo -e "  Active topic set to ${CYAN}${name}${RESET}"
 }
 
 cmd_topic_list() {
-  load_config
+  check_gh
+  local hub
+  hub=$(require_hub)
 
-  # Read topics from config
-  local topics_json
-  topics_json=$(json_read "$CONFIG_FILE" ".topics" 2>/dev/null || echo "{}")
+  local active
+  active=$(config_get "active_topic")
 
-  if [[ "$topics_json" == "{}" || "$topics_json" == "null" ]]; then
+  # Fetch topic labels from hub repo
+  local labels
+  labels=$(gh label list -R "$hub" --json name --jq '.[].name | select(startswith("topic:"))' 2>/dev/null) || {
+    echo -e "${RED}Error:${RESET} Failed to list labels from ${hub}."
+    exit 1
+  }
+
+  if [[ -z "$labels" ]]; then
     echo -e "${DIM}No topics yet — run: hive topic create <name>${RESET}"
     return
   fi
 
-  local active
-  active=$(json_read "$CONFIG_FILE" ".active_topic" 2>/dev/null || echo "null")
-
   echo -e "${BOLD}Topics${RESET}"
   echo ""
 
-  if command -v jq &>/dev/null; then
-    jq -r --arg active "$active" '
-      .topics | to_entries[] |
-      (if .key == $active then "  * " else "    " end) +
-      .key + "  #" + (.value.project_number | tostring) + "  " + .value.created
-    ' "$CONFIG_FILE"
-  else
-    python3 -c "
-import json
-with open('$CONFIG_FILE') as f:
-    data = json.load(f)
-active = data.get('active_topic')
-for name, info in sorted(data.get('topics', {}).items()):
-    marker = '  * ' if name == active else '    '
-    print(f\"{marker}{name}  #{info['project_number']}  {info['created']}\")
-"
-  fi
+  while IFS= read -r label; do
+    local name="${label#topic:}"
+    if [[ "$name" == "$active" ]]; then
+      echo -e "  ${GREEN}*${RESET} ${BOLD}${name}${RESET}"
+    else
+      echo -e "    ${name}"
+    fi
+  done <<< "$labels"
 
   echo ""
   echo -e "${DIM}* = active topic${RESET}"
+}
+
+cmd_topic_set() {
+  local name="${1:-}"
+
+  if [[ -z "$name" ]]; then
+    echo -e "${RED}Error:${RESET} Topic name required."
+    echo "  Usage: hive topic set <name>"
+    exit 1
+  fi
+
+  check_gh
+  local hub
+  hub=$(require_hub)
+
+  # Verify label exists
+  local exists
+  exists=$(gh label list -R "$hub" --json name --jq ".[].name | select(. == \"topic:${name}\")" 2>/dev/null)
+
+  if [[ -z "$exists" ]]; then
+    echo -e "${RED}Error:${RESET} Topic '${name}' does not exist."
+    echo "  Run: hive topic list"
+    exit 1
+  fi
+
+  config_set "active_topic" "$name"
+  echo -e "${GREEN}✓${RESET} Active topic set to ${CYAN}${name}${RESET}"
 }
 
 cmd_topic() {
@@ -237,17 +325,233 @@ cmd_topic() {
     list|ls)
       cmd_topic_list
       ;;
+    set|switch)
+      cmd_topic_set "$@"
+      ;;
     "")
       echo -e "${RED}Error:${RESET} Missing subcommand."
-      echo "  Usage: hive topic <create|list> [args]"
+      echo "  Usage: hive topic <create|list|set> [args]"
       exit 1
       ;;
     *)
       echo -e "${RED}Error:${RESET} Unknown topic subcommand '${subcmd}'."
-      echo "  Available: create, list"
+      echo "  Available: create, list, set"
       exit 1
       ;;
   esac
+}
+
+# ─── Log Command ──────────────────────────────────────────────────────────────
+
+build_log_body() {
+  local agent repo branch timestamp
+  agent="$(whoami)@$(hostname -s 2>/dev/null || hostname)"
+  repo=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || echo "none")
+  branch=$(git branch --show-current 2>/dev/null || echo "none")
+  timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+  cat <<EOF
+**Agent:** ${agent}
+**Repo:** ${repo}
+**Branch:** ${branch}
+**Timestamp:** ${timestamp}
+EOF
+}
+
+cmd_log() {
+  local message="$*"
+
+  if [[ -z "$message" ]]; then
+    echo -e "${RED}Error:${RESET} Message required."
+    echo "  Usage: hive log <message>"
+    echo "  Example: hive log \"Completed JWT middleware extraction\""
+    exit 1
+  fi
+
+  check_gh
+  local hub topic
+  hub=$(require_hub)
+  topic=$(require_topic)
+
+  local body issue_url
+  body=$(build_log_body)
+
+  echo -e "${DIM}Logging to topic:${topic}...${RESET}"
+
+  issue_url=$(gh issue create -R "$hub" \
+    --title "$message" \
+    --label "topic:${topic}" \
+    --body "$body" 2>/dev/null) || {
+    echo -e "${RED}Error:${RESET} Failed to create issue on ${hub}."
+    exit 1
+  }
+
+  # Add to Project dashboard (best-effort)
+  local project_number
+  project_number=$(config_get "project_number")
+  if [[ -n "$project_number" && "$project_number" != "0" ]]; then
+    local hub_org="${hub%%/*}"
+    gh project item-add "$project_number" --owner "$hub_org" --url "$issue_url" &>/dev/null || true
+  fi
+
+  echo -e "${GREEN}✓${RESET} Logged: ${BOLD}${message}${RESET}"
+  echo -e "  ${DIM}${issue_url}${RESET}"
+}
+
+# ─── Read Command ─────────────────────────────────────────────────────────────
+
+relative_time() {
+  local timestamp="$1"
+  local now seconds_ago
+
+  if date -j &>/dev/null 2>&1; then
+    # macOS
+    local then_epoch now_epoch
+    then_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$timestamp" "+%s" 2>/dev/null || echo "0")
+    now_epoch=$(date "+%s")
+    seconds_ago=$((now_epoch - then_epoch))
+  else
+    # Linux
+    local then_epoch now_epoch
+    then_epoch=$(date -d "$timestamp" "+%s" 2>/dev/null || echo "0")
+    now_epoch=$(date "+%s")
+    seconds_ago=$((now_epoch - then_epoch))
+  fi
+
+  if [[ "$seconds_ago" -lt 60 ]]; then
+    echo "just now"
+  elif [[ "$seconds_ago" -lt 3600 ]]; then
+    echo "$((seconds_ago / 60))m ago"
+  elif [[ "$seconds_ago" -lt 86400 ]]; then
+    echo "$((seconds_ago / 3600))h ago"
+  elif [[ "$seconds_ago" -lt 604800 ]]; then
+    echo "$((seconds_ago / 86400))d ago"
+  else
+    echo "$((seconds_ago / 604800))w ago"
+  fi
+}
+
+cmd_read() {
+  check_gh
+  local hub
+  hub=$(require_hub)
+
+  local limit=20
+  local label_filter=""
+  local show_all=false
+
+  # Parse flags
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --all|-a)
+        show_all=true
+        shift
+        ;;
+      --limit|-n)
+        limit="${2:-20}"
+        shift 2
+        ;;
+      *)
+        shift
+        ;;
+    esac
+  done
+
+  if [[ "$show_all" == "false" ]]; then
+    local topic
+    topic=$(require_topic)
+    label_filter="--label topic:${topic}"
+    echo -e "${BOLD}Topic: ${CYAN}${topic}${RESET}"
+  else
+    echo -e "${BOLD}All Topics${RESET}"
+  fi
+  echo ""
+
+  local issues_json
+  # shellcheck disable=SC2086
+  issues_json=$(gh issue list -R "$hub" \
+    $label_filter \
+    --json number,title,author,createdAt,body,labels \
+    --limit "$limit" \
+    --state all 2>/dev/null) || {
+    echo -e "${RED}Error:${RESET} Failed to read issues from ${hub}."
+    exit 1
+  }
+
+  local count
+  if command -v jq &>/dev/null; then
+    count=$(echo "$issues_json" | jq 'length')
+  else
+    count=$(python3 -c "import json,sys; print(len(json.loads(sys.stdin.read())))" <<< "$issues_json")
+  fi
+
+  if [[ "$count" == "0" ]]; then
+    echo -e "${DIM}No log entries yet — run: hive log \"your message\"${RESET}"
+    return
+  fi
+
+  # Format and display entries
+  if command -v jq &>/dev/null; then
+    echo "$issues_json" | jq -r '.[] | "#\(.number)  \(.createdAt)  @\(.author.login)\n     \(.title)\n     \(.body | split("\n") | map(select(startswith("**Repo:"))) | .[0] // "" | ltrimstr("**Repo:** "))\n"'
+  else
+    python3 -c "
+import json, sys
+issues = json.loads(sys.stdin.read())
+for issue in issues:
+    num = issue['number']
+    title = issue['title']
+    author = issue['author']['login']
+    created = issue['createdAt']
+    body = issue.get('body', '')
+    repo = 'none'
+    for line in body.split('\n'):
+        if line.startswith('**Repo:**'):
+            repo = line.replace('**Repo:**', '').strip()
+    print(f'  #{num}  {created}  @{author}')
+    print(f'       {title}')
+    if repo != 'none':
+        print(f'       repo: {repo}')
+    print()
+" <<< "$issues_json"
+  fi | while IFS= read -r line; do
+    # Replace ISO timestamps with relative times where possible
+    echo "$line"
+  done
+
+  echo -e "${DIM}Showing ${count} entries (limit: ${limit})${RESET}"
+}
+
+# ─── Status Command ───────────────────────────────────────────────────────────
+
+cmd_status() {
+  load_config
+  local hub topic project_number
+
+  hub=$(config_get "hub")
+  topic=$(config_get "active_topic")
+  project_number=$(config_get "project_number")
+
+  echo -e "${BOLD}Hive Status${RESET}"
+  echo ""
+
+  if [[ -z "$hub" ]]; then
+    echo -e "  Hub:     ${DIM}not configured — run: hive init <owner/repo>${RESET}"
+  else
+    echo -e "  Hub:     ${CYAN}${hub}${RESET}"
+  fi
+
+  if [[ -z "$topic" ]]; then
+    echo -e "  Topic:   ${DIM}none${RESET}"
+  else
+    echo -e "  Topic:   ${GREEN}${topic}${RESET}"
+  fi
+
+  if [[ -n "$project_number" && "$project_number" != "0" ]]; then
+    local hub_org="${hub%%/*}"
+    echo -e "  Project: ${DIM}https://github.com/orgs/${hub_org}/projects/${project_number}${RESET}"
+  fi
+
+  echo ""
 }
 
 # ─── Help ─────────────────────────────────────────────────────────────────────
@@ -258,22 +562,29 @@ cmd_help() {
 ${BOLD}hive${RESET} — LLM Hive Mind CLI
   Shared memory bus for LLM CLI tools via GitHub Issues + Projects v2.
 
-${BOLD}Usage:${RESET}
-  hive <command> [subcommand] [args]
+${BOLD}Setup:${RESET}
+  hive init <owner/repo>   Connect to a hub repo (creates repo + Project if needed)
 
-${BOLD}Commands:${RESET}
-  topic create <name>    Create a new topic (GitHub Project)
-  topic list             List all topics
-  log <message>          Log a thought to the active topic (coming soon)
-  read                   Read the conversation log (coming soon)
-  status                 Show current hive status (coming soon)
+${BOLD}Topics:${RESET}
+  hive topic create <name> Create a new topic
+  hive topic list          List all topics
+  hive topic set <name>    Switch active topic
 
-${BOLD}Options:${RESET}
-  --help, -h             Show this help message
+${BOLD}Communication:${RESET}
+  hive log <message>       Log a message to the active topic
+  hive read                Read recent log entries for the active topic
+  hive read --all          Read entries across all topics
+  hive read --limit N      Limit number of entries (default: 20)
+
+${BOLD}Info:${RESET}
+  hive status              Show current hub, topic, and project link
+  hive --help              Show this help message
 
 ${BOLD}Examples:${RESET}
+  hive init AI-Agents-Misc/hive-hub
   hive topic create auth-refactor
-  hive topic list
+  hive log "Completed JWT middleware extraction"
+  hive read
 
 EOF
 }
@@ -285,20 +596,20 @@ main() {
   shift || true
 
   case "$cmd" in
+    init)
+      cmd_init "$@"
+      ;;
     topic)
       cmd_topic "$@"
       ;;
     log)
-      echo -e "${YELLOW}Coming soon:${RESET} hive log"
-      exit 0
+      cmd_log "$@"
       ;;
     read)
-      echo -e "${YELLOW}Coming soon:${RESET} hive read"
-      exit 0
+      cmd_read "$@"
       ;;
     status)
-      echo -e "${YELLOW}Coming soon:${RESET} hive status"
-      exit 0
+      cmd_status
       ;;
     --help|-h|help)
       cmd_help
